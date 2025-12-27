@@ -1,0 +1,602 @@
+/* Samsung UK Cart A/B Experiment
+   Paste this entire block into the console on /uk/cart and run.
+   Entry: window.SGExperiment.init() (auto-initialises)
+*/
+
+(function () {
+  if (window.SGExperiment) {
+    console.warn('SGExperiment already present — reusing existing instance.');
+    return;
+  }
+
+  const SGExperiment = {
+    id: 'sg-cart-ab-v1',
+    cssId: 'sg-experiment-styles',
+    dataAttr: 'data-sg-experiment',
+    init() {
+      this.injectStyles();
+      this.setupObservers();
+      this.safeInit();
+    },
+
+    /* -------------------------
+       Styles
+    ------------------------- */
+    injectStyles() {
+      if (document.getElementById(this.cssId)) return;
+      const style = document.createElement('style');
+      style.id = this.cssId;
+      style.textContent = `
+      /* Voucher toggle link */
+      .sg-voucher-toggle {
+        color: #0b57d0;
+        cursor: pointer;
+        font-weight: 500;
+        text-decoration: underline;
+        display: inline-block;
+        margin: 6px 0;
+      }
+      .sg-voucher-wrapper { display: inline-block; margin-left: 8px; vertical-align: middle; }
+
+      /* Holiday badge */
+      .sg-holiday-badge {
+        display: inline-block;
+        background: #f2f4f8;
+        color: #0b57d0;
+        border-radius: 12px;
+        padding: 6px 10px;
+        font-size: 13px;
+        font-weight: 500;
+        margin-left: 8px;
+        border: 1px solid rgba(11,87,208,0.08);
+        vertical-align: middle;
+      }
+      @media (max-width: 640px) {
+        .sg-holiday-badge { font-size: 12px; padding: 5px 8px; margin-top: 6px; display: block; }
+      }
+
+      /* Trade-in teaser */
+      .sg-tradein-teaser {
+        display: block;
+        color: #0b57d0;
+        font-size: 13px;
+        margin-top: 6px;
+        cursor: pointer;
+        text-decoration: underline;
+      }
+      .sg-tradein-teaser:focus { outline: 2px solid rgba(11,87,208,0.25); outline-offset: 2px; }
+
+      /* Visually hide but keep accessible */
+      .sg-visually-hidden {
+        position: absolute !important;
+        height: 1px; width: 1px;
+        overflow: hidden;
+        clip: rect(1px, 1px, 1px, 1px);
+        white-space: nowrap;
+      }
+      `;
+      document.head.appendChild(style);
+    },
+
+    /* -------------------------
+       Utilities
+    ------------------------- */
+    waitFor(selectorOrFn, { timeout = 8000, interval = 200 } = {}) {
+      // selectorOrFn: string selector or function returning truthy
+      return new Promise((resolve, reject) => {
+        const start = Date.now();
+        const check = () => {
+          try {
+            const result = typeof selectorOrFn === 'function' ? selectorOrFn() : document.querySelector(selectorOrFn);
+            if (result) return resolve(result);
+            if (Date.now() - start > timeout) return reject(new Error('waitFor timeout: ' + (typeof selectorOrFn === 'string' ? selectorOrFn : 'function')));
+            setTimeout(check, interval);
+          } catch (err) {
+            reject(err);
+          }
+        };
+        check();
+      });
+    },
+
+    queryAllTextNodes(root = document.body, textRegex) {
+      const matches = [];
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, {
+        acceptNode(node) {
+          if (node && node.textContent && textRegex.test(node.textContent)) return NodeFilter.FILTER_ACCEPT;
+          return NodeFilter.FILTER_SKIP;
+        }
+      });
+      while (walker.nextNode()) matches.push(walker.currentNode);
+      return matches;
+    },
+
+    formatCurrency(num) {
+      try {
+        return new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP', maximumFractionDigits: 0 }).format(num);
+      } catch (e) {
+        return `£${Math.round(num)}`;
+      }
+    },
+
+    /* -------------------------
+       Observers & Init
+    ------------------------- */
+    setupObservers() {
+      // Observe body for cart re-renders and re-run idempotent handlers
+      const mo = new MutationObserver((mutations) => {
+        // Debounce
+        if (this._reRenderTimer) clearTimeout(this._reRenderTimer);
+        this._reRenderTimer = setTimeout(() => {
+          this.safeInit();
+        }, 250);
+      });
+      mo.observe(document.body, { childList: true, subtree: true });
+      this._mutationObserver = mo;
+    },
+
+    async safeInit() {
+      try {
+        // Run each feature; each is idempotent and checks for duplicates
+        await Promise.all([
+          this.initVoucherToggle(),
+          this.initHolidayBadge(),
+          this.initTradeInTeasers()
+        ]);
+      } catch (err) {
+        // Non-fatal: log for debugging
+        console.warn('SGExperiment init partial failure:', err && err.message);
+      }
+    },
+
+    /* -------------------------
+       1) Voucher Input UX Variant
+    ------------------------- */
+    async initVoucherToggle() {
+      // Find a voucher form: look for a form or container with an input and a button labelled 'Apply'
+      const findVoucher = () => {
+        // Common patterns: button text 'Apply', 'Apply voucher', input placeholder 'Voucher', 'Promo code'
+        const buttons = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"]'));
+        for (const btn of buttons) {
+          const txt = (btn.textContent || btn.value || '').trim().toLowerCase();
+          if (txt.includes('apply') && txt.includes('voucher') || txt === 'apply' || txt === 'apply code' || txt === 'apply promo') {
+            // find nearest input sibling
+            const container = btn.closest('form') || btn.parentElement;
+            if (!container) continue;
+            const input = container.querySelector('input[type="text"], input[type="search"], input[placeholder], input[name*="voucher"], input[name*="promo"], input[name*="code"]');
+            if (input) return { container, input, button: btn };
+          }
+        }
+        // fallback: look for input with placeholder 'Voucher' or 'Promo'
+        const fallbackInput = document.querySelector('input[placeholder*="Voucher"], input[placeholder*="voucher"], input[placeholder*="Promo"], input[placeholder*="promo"], input[name*="voucher"], input[name*="promo"]');
+        if (fallbackInput) {
+          const container = fallbackInput.closest('form') || fallbackInput.parentElement;
+          const button = container && (container.querySelector('button') || container.querySelector('input[type="submit"]'));
+          return { container, input: fallbackInput, button };
+        }
+        return null;
+      };
+
+      const voucher = findVoucher();
+      if (!voucher) {
+        // Try waiting for voucher area to appear
+        try {
+          await this.waitFor(() => findVoucher(), { timeout: 6000 });
+        } catch (e) {
+          // no voucher found; not fatal
+          return;
+        }
+      }
+
+      const v = findVoucher();
+      if (!v || !v.container) return;
+      const container = v.container;
+
+      // Avoid duplicate injection
+      if (container.closest(`[${this.dataAttr}="voucher"]`) || container.querySelector('.sg-voucher-toggle')) {
+        return;
+      }
+
+      // Create toggle link and wrapper
+      const wrapper = document.createElement('div');
+      wrapper.setAttribute(this.dataAttr, 'voucher');
+      wrapper.className = 'sg-voucher-wrapper';
+      // Place the wrapper before the voucher container to keep layout similar
+      container.parentNode.insertBefore(wrapper, container);
+
+      const toggle = document.createElement('a');
+      toggle.href = '#';
+      toggle.className = 'sg-voucher-toggle';
+      toggle.textContent = 'Have a voucher?';
+      toggle.setAttribute('role', 'button');
+      toggle.setAttribute('aria-expanded', 'false');
+
+      // Move the original container into a collapsible container
+      const collapsible = document.createElement('div');
+      collapsible.style.display = 'none';
+      collapsible.className = 'sg-voucher-collapsible';
+      // Move the voucher container into collapsible (but keep original form behavior)
+      collapsible.appendChild(container);
+      wrapper.appendChild(toggle);
+      wrapper.appendChild(collapsible);
+
+      // Toggle behavior
+      const toggleFn = (e) => {
+        if (e) e.preventDefault();
+        const isOpen = collapsible.style.display !== 'none';
+        collapsible.style.display = isOpen ? 'none' : '';
+        toggle.setAttribute('aria-expanded', String(!isOpen));
+      };
+      toggle.addEventListener('click', toggleFn);
+      toggle.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          toggleFn();
+        }
+      });
+
+      // Ensure original submit still works: nothing to do because we moved the original DOM node.
+      // If the cart re-renders and replaces the voucher container, our MutationObserver will re-run safeInit and reattach.
+    },
+
+    /* -------------------------
+       2) Holiday Returns Badge Refactor
+    ------------------------- */
+    async initHolidayBadge() {
+      // Find the big banner by searching for nodes containing 'holiday' and 'returns' (case-insensitive)
+      const bannerNode = Array.from(document.querySelectorAll('div, section, header, p, span')).find(el => {
+        const txt = (el.textContent || '').toLowerCase();
+        return txt.includes('holiday') && txt.includes('returns') && txt.length < 400;
+      });
+
+      if (!bannerNode) {
+        // nothing to do
+        return;
+      }
+
+      // Avoid reusing if already moved
+      if (bannerNode.getAttribute(this.dataAttr) === 'holiday-moved') return;
+
+      // Find summary panel / order total area
+      const summarySelectors = [
+        '[data-testid="order-summary"]',
+        '.order-summary',
+        '.cart-summary',
+        '.checkout-summary',
+        '.summary',
+        '.cart__summary',
+        '#cart-summary'
+      ];
+      let summary = null;
+      for (const sel of summarySelectors) {
+        summary = document.querySelector(sel);
+        if (summary) break;
+      }
+      // fallback: find element that contains 'Order total' text
+      if (!summary) {
+        const candidates = Array.from(document.querySelectorAll('div, section, aside'));
+        summary = candidates.find(el => /order total|subtotal|checkout/i.test(el.textContent || ''));
+      }
+      if (!summary) {
+        // can't find summary; abort gracefully
+        return;
+      }
+
+      // Create badge by reusing the banner node's text
+      const badge = document.createElement('div');
+      badge.className = 'sg-holiday-badge';
+      badge.setAttribute(this.dataAttr, 'holiday-badge');
+
+      // Shorten copy: prefer to reuse text but shorten to "Free holiday returns until 10 January 2026"
+      // If banner contains a date, try to extract it; otherwise use the suggested copy.
+      const bannerText = (bannerNode.textContent || '').trim();
+      let badgeText = 'Free holiday returns until 10 January 2026';
+      // Try to extract a date like '10 January 2026' from bannerText
+      const dateMatch = bannerText.match(/\b\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b/i);
+      if (dateMatch) {
+        badgeText = `Free holiday returns until ${dateMatch[0]}`;
+      } else {
+        // If banner contains 'free' and 'returns' and a year, try to extract year
+        const yearMatch = bannerText.match(/\b20\d{2}\b/);
+        if (yearMatch) {
+          badgeText = `Free holiday returns until ${yearMatch[0]}`;
+        } else {
+          // fallback: keep suggested copy
+        }
+      }
+      badge.textContent = badgeText;
+
+      // Hide original banner visually but keep in DOM (so any scripts referencing it still work)
+      bannerNode.style.display = 'none';
+      bannerNode.setAttribute(this.dataAttr, 'holiday-moved');
+
+      // Insert badge near checkout button / order total
+      // Try to append to summary header or near the checkout button
+      const checkoutBtn = summary.querySelector('button, a') || document.querySelector('button.checkout, a.checkout, button#checkout');
+      if (checkoutBtn && checkoutBtn.parentNode) {
+        // Insert badge before checkout button
+        checkoutBtn.parentNode.insertBefore(badge, checkoutBtn);
+      } else {
+        // Append to summary
+        summary.appendChild(badge);
+      }
+    },
+
+    /* -------------------------
+       3) Inline Trade-In Value Teaser & 4) Brand-aware Copy
+    ------------------------- */
+    async initTradeInTeasers() {
+      // Wait for cart line items to appear
+      const lineItemSelectorCandidates = [
+        '.cart-item', '.cart__item', '.cart-item-row', '[data-testid="cart-item"]', '.basket-item', '.line-item'
+      ];
+      let items = [];
+      for (const sel of lineItemSelectorCandidates) {
+        items = Array.from(document.querySelectorAll(sel));
+        if (items.length) break;
+      }
+      // fallback: find list items that contain a price symbol
+      if (!items.length) {
+        const candidates = Array.from(document.querySelectorAll('li, div'));
+        items = candidates.filter(el => /\£\s?\d/.test(el.textContent || '') && (el.querySelector('img') || el.querySelector('h3') || el.querySelector('a')));
+      }
+      if (!items.length) {
+        // wait a bit for async load
+        try {
+          await this.waitFor(() => {
+            const cands = Array.from(document.querySelectorAll('li, div')).filter(el => /\£\s?\d/.test(el.textContent || '') && (el.querySelector('img') || el.querySelector('h3') || el.querySelector('a')));
+            return cands.length ? cands : null;
+          }, { timeout: 7000 });
+          // re-evaluate
+          const candidates = Array.from(document.querySelectorAll('li, div'));
+          items = candidates.filter(el => /\£\s?\d/.test(el.textContent || '') && (el.querySelector('img') || el.querySelector('h3') || el.querySelector('a')));
+        } catch (e) {
+          // no items found; abort
+          return;
+        }
+      }
+
+      // Find the original Trade-In card/section (so we can hide it visually but keep functionality)
+      const tradeInSection = Array.from(document.querySelectorAll('div, section')).find(el => {
+        const txt = (el.textContent || '').toLowerCase();
+        return txt.includes('trade-in') || txt.includes('trade in') || txt.includes('tradein');
+      });
+      // If found, keep a reference to any actionable element inside it (button/link) to trigger the flow
+      let tradeInAction = null;
+      if (tradeInSection) {
+        tradeInAction = tradeInSection.querySelector('button, a, input[type="button"]');
+        // visually hide the trade-in section but keep it accessible to scripts
+        tradeInSection.classList.add('sg-visually-hidden');
+        tradeInSection.setAttribute(this.dataAttr, 'tradein-hidden');
+      } else {
+        // fallback: try to find any button with 'Trade' text
+        tradeInAction = Array.from(document.querySelectorAll('button, a')).find(el => /trade[- ]?in/i.test(el.textContent || ''));
+      }
+
+      // Extract trade-in data (max discount) from the page if possible
+      const tradeInMaxByBrand = this.extractTradeInDataFromPage();
+
+      // Determine user brand
+      const brand = this.detectBrand();
+
+      // Build brand-aware copy (without amount yet)
+      const brandText = this.brandToText(brand);
+
+      // For each cart item, insert teaser under the price
+      items.forEach(item => {
+        // Avoid duplicates
+        if (item.querySelector('[data-sg-experiment="tradein-teaser"]')) return;
+
+        // Find price node inside item
+        const priceNode = Array.from(item.querySelectorAll('div, span, p, strong')).find(el => /\£\s?\d/.test(el.textContent || ''));
+        if (!priceNode) return;
+
+        // Create teaser
+        const teaser = document.createElement('a');
+        teaser.href = '#';
+        teaser.className = 'sg-tradein-teaser';
+        teaser.setAttribute('data-sg-experiment', 'tradein-teaser');
+        teaser.setAttribute('role', 'button');
+        teaser.setAttribute('tabindex', '0');
+        teaser.textContent = 'Trade-in savings: checking…'; // placeholder until we compute
+
+        // Insert after priceNode
+        priceNode.parentNode.insertBefore(teaser, priceNode.nextSibling);
+
+        // Click handler: trigger the original trade-in action if available
+        teaser.addEventListener('click', (e) => {
+          e.preventDefault();
+          if (tradeInAction) {
+            tradeInAction.click();
+          } else {
+            // fallback: try to open any modal by dispatching custom event
+            const evt = new CustomEvent('openTradeIn', { bubbles: true });
+            teaser.dispatchEvent(evt);
+          }
+        });
+        teaser.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            teaser.click();
+          }
+        });
+
+        // Compute teaser text without flashing: if we have tradeInMaxByBrand, show amount; otherwise show brand-aware copy without amount
+        const maxVal = tradeInMaxByBrand && tradeInMaxByBrand[brand.toLowerCase()];
+        if (maxVal) {
+          teaser.textContent = `${brandText} and get an instant discount of up to ${this.formatCurrency(maxVal)}.`;
+        } else {
+          // If we have any numeric max across brands, show generic amount
+          const anyMax = tradeInMaxByBrand && Object.values(tradeInMaxByBrand).reduce((a, b) => Math.max(a || 0, b || 0), 0);
+          if (anyMax) {
+            teaser.textContent = `${brandText} and get an instant discount of up to ${this.formatCurrency(anyMax)}.`;
+          } else {
+            // No amounts available: show brand-aware prompt without amount
+            teaser.textContent = `Trade in your ${brandText.toLowerCase()} for an instant discount.`;
+          }
+        }
+      });
+    },
+
+    detectBrand() {
+      const ua = (navigator.userAgent || '').toLowerCase();
+      const vendor = (navigator.vendor || '').toLowerCase();
+      const brandList = ['samsung','apple','google','huawei','motorola','oneplus','oppo','realme','sony','xiaomi'];
+      // Check vendor first
+      for (const b of brandList) {
+        if (vendor.includes(b)) return this.normalizeBrand(b);
+      }
+      // Check userAgent
+      for (const b of brandList) {
+        if (ua.includes(b)) return this.normalizeBrand(b);
+      }
+      // Heuristics: if mobile UA but no brand, return 'Any Smartphone'
+      if (/mobile|iphone|android|ipad/.test(ua)) return 'Any Smartphone';
+      return 'your smartphone';
+    },
+
+    normalizeBrand(b) {
+      if (!b) return 'your smartphone';
+      const map = {
+        'samsung': 'Samsung',
+        'apple': 'Apple',
+        'google': 'Google',
+        'huawei': 'Huawei',
+        'motorola': 'Motorola',
+        'oneplus': 'OnePlus',
+        'oppo': 'Oppo',
+        'realme': 'Realme',
+        'sony': 'Sony',
+        'xiaomi': 'Xiaomi'
+      };
+      return map[b.toLowerCase()] || 'your smartphone';
+    },
+
+    brandToText(brand) {
+      // brand is a friendly string like 'Apple' or 'Any Smartphone' or 'your smartphone'
+      if (!brand) return 'Trade in your phone';
+      if (/Any Smartphone/i.test(brand)) return 'Trade in any smartphone and get an instant discount';
+      if (/your smartphone/i.test(brand)) return 'Trade in your smartphone and get an instant discount';
+      return `Trade in your ${brand} device and get an instant discount`;
+    },
+
+    extractTradeInDataFromPage() {
+      // Try multiple heuristics to find trade-in values already present on the page:
+      // 1) Look for elements inside trade-in section that contain currency values
+      // 2) Look for JSON in script tags that mention 'trade' or 'tradeIn'
+      // 3) Look for global variables with 'trade' in the name (safe enumeration limited)
+      const result = {};
+
+      // 1) DOM scan for currency values inside nodes that mention 'trade'
+      const tradeNodes = Array.from(document.querySelectorAll('div, section, script')).filter(el => {
+        const txt = (el.textContent || '').toLowerCase();
+        return txt.includes('trade') || txt.includes('trade-in') || txt.includes('trade in');
+      });
+      tradeNodes.forEach(node => {
+        const text = node.textContent || '';
+        const matches = Array.from(text.matchAll(/£\s?(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)/g));
+        matches.forEach(m => {
+          const num = Number(m[1].replace(/,/g, ''));
+          if (!isNaN(num)) {
+            // assign to generic key
+            result['generic'] = Math.max(result['generic'] || 0, num);
+          }
+        });
+      });
+
+      // 2) Script tags with JSON
+      const scripts = Array.from(document.querySelectorAll('script[type="application/json"], script:not([src])'));
+      for (const s of scripts) {
+        const txt = s.textContent || '';
+        if (!/trade/i.test(txt)) continue;
+        try {
+          // Try to find JSON objects inside the script
+          const jsonMatches = txt.match(/\{[\s\S]*\}/);
+          if (jsonMatches) {
+            const parsed = JSON.parse(jsonMatches[0]);
+            // Walk parsed object to find numeric values that look like trade-in amounts
+            const walk = (obj) => {
+              if (!obj) return;
+              if (typeof obj === 'number') {
+                // if number looks like a price (>=10)
+                if (obj >= 10 && obj < 10000) result['generic'] = Math.max(result['generic'] || 0, obj);
+              } else if (typeof obj === 'string') {
+                const m = obj.match(/£\s?(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?)/);
+                if (m) {
+                  const num = Number(m[1].replace(/,/g, ''));
+                  if (!isNaN(num)) result['generic'] = Math.max(result['generic'] || 0, num);
+                }
+              } else if (Array.isArray(obj)) {
+                obj.forEach(walk);
+              } else if (typeof obj === 'object') {
+                Object.keys(obj).forEach(k => {
+                  const key = k.toLowerCase();
+                  if (/brand|make|model|trade|value|price|max|amount/.test(key)) {
+                    walk(obj[k]);
+                  } else {
+                    walk(obj[k]);
+                  }
+                });
+              }
+            };
+            walk(parsed);
+          }
+        } catch (e) {
+          // ignore parse errors
+        }
+      }
+
+      // 3) Try to inspect a few window properties safely (limit to first 200 keys)
+      try {
+        const keys = Object.keys(window).slice(0, 200);
+        for (const k of keys) {
+          if (!/trade/i.test(k)) continue;
+          try {
+            const val = window[k];
+            if (typeof val === 'object' && val) {
+              // look for brand keys
+              for (const brand of ['samsung','apple','google','huawei','motorola','oneplus','oppo','realme','sony','xiaomi']) {
+                if (val[brand] && typeof val[brand] === 'number') {
+                  result[brand] = Math.max(result[brand] || 0, val[brand]);
+                }
+              }
+              // look for numeric values
+              const walk = (o) => {
+                if (!o) return;
+                if (typeof o === 'number' && o >= 10 && o < 10000) result['generic'] = Math.max(result['generic'] || 0, o);
+                else if (Array.isArray(o)) o.forEach(walk);
+                else if (typeof o === 'object') Object.values(o).forEach(walk);
+              };
+              walk(val);
+            }
+          } catch (e) {
+            // ignore
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
+
+      // If we found only generic, map it to a few brands as fallback
+      if (result['generic']) {
+        const fallback = result['generic'];
+        const brands = ['samsung','apple','google','huawei','motorola','oneplus','oppo','realme','sony','xiaomi'];
+        brands.forEach(b => {
+          if (!result[b]) result[b] = fallback;
+        });
+      }
+
+      return result;
+    }
+  };
+
+  // Expose to window for debugging and manual re-init
+  window.SGExperiment = SGExperiment;
+  // Auto-init
+  try {
+    SGExperiment.init();
+    console.info('SGExperiment initialised. If you need to re-run, call window.SGExperiment.init()');
+  } catch (e) {
+    console.error('SGExperiment failed to initialise:', e);
+  }
+})();
