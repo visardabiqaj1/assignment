@@ -10,7 +10,7 @@ How to run
 1. 	Open the Samsung UK cart page () after adding a Galaxy Z Fold7.
 2. 	Open DevTools → Console.
 3. 	Paste the entire code block below and press Enter.
-4. 	Call the entry function if needed (the script auto-initialises). The entry function is .
+4. 	Call the entry function if needed (the script auto-initialises). The entry function is window.SGExperiment && window.SGExperiment.init() .
 
 
 
